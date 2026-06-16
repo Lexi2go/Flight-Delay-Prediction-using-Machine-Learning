@@ -1,7 +1,7 @@
 """
 ================================================================================
 FLUGVERSPÄTUNGS-PROGNOSE – United Airlines @ JFK
-Production-Ready Version (mit Config + Fixes)
+Production-Ready Version mit Dashboard (8 Plots)
 ================================================================================
 """
 
@@ -18,7 +18,6 @@ import matplotlib.gridspec as gridspec
 import seaborn as sns
 
 import lightgbm as lgb
-from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import (
     classification_report, confusion_matrix,
     roc_auc_score, roc_curve, precision_recall_curve,
@@ -26,22 +25,21 @@ from sklearn.metrics import (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIG LADEN
+# CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
-# Pfade
 ARR_PATH = config["paths"]["input"]["arrivals"]
 DEP_PATH = config["paths"]["input"]["departures"]
 OUT_PLOT = config["paths"]["output"]["plots"]
 OUT_MODEL = config["paths"]["output"]["model"]
 OUT_METRICS = config["paths"]["output"]["metrics"]
 
-os.makedirs("outputs", exist_ok=True)
+os.makedirs(os.path.dirname(OUT_PLOT), exist_ok=True)
 
-# Styling
 sns.set_style("whitegrid")
+
 COLORS = {
     "primary": "#1B4F72",
     "secondary": "#2E86C1",
@@ -51,7 +49,7 @@ COLORS = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATEN LADEN
+# LOAD DATA
 # ─────────────────────────────────────────────────────────────────────────────
 print("Lade Daten...")
 
@@ -65,7 +63,7 @@ arr = arr.dropna(subset=["Date (MM/DD/YYYY)"])
 dep = dep.dropna(subset=["Date (MM/DD/YYYY)"])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FEATURE ENGINEERING (Leakage reduziert!)
+# FEATURE ENGINEERING
 # ─────────────────────────────────────────────────────────────────────────────
 def build_features(df):
     df = df.copy()
@@ -89,19 +87,17 @@ def build_features(df):
         format="%H:%M",
         errors="coerce"
     )
+
     df["hour_of_day"] = df["sched_time"].dt.hour
     df["is_peak_hour"] = df["hour_of_day"].between(14, 20).astype(int)
 
-    df["route"] = df["Destination Airport"].fillna("UNKNOWN")
+    df["route"] = df["Destination Airport"].fillna("UNKNOWN").astype("category")
 
-    # Ziel
     df["raw_delay"] = df["Departure delay (Minutes)"]
     df["target"] = (df["raw_delay"] >= 15).astype(int)
 
-    # Sortierung für historische Features
     df = df.sort_values("date").reset_index(drop=True)
 
-    # Historische Performance (Leakage sicher)
     df["carrier_hist_delay"] = (
         df.groupby("Carrier Code")["raw_delay"]
         .transform(lambda x: x.shift(1).expanding().mean())
@@ -118,15 +114,11 @@ dep_feat = build_features(dep)
 FEATURE_COLS = [
     "year", "month", "day_of_week", "is_weekend",
     "season", "hour_of_day", "is_peak_hour",
-    "carrier_hist_delay"
+    "carrier_hist_delay", "route"
 ]
 
-# Kategorie korrekt behandeln (kein LabelEncoder nötig!)
-dep_feat["route"] = dep_feat["route"].astype("category")
-FEATURE_COLS.append("route")
-
 # ─────────────────────────────────────────────────────────────────────────────
-# TRAIN / TEST SPLIT
+# SPLIT
 # ─────────────────────────────────────────────────────────────────────────────
 split_year = config["split"]["train_until_year"]
 
@@ -139,7 +131,7 @@ X_test  = test[FEATURE_COLS]
 y_test  = test["target"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODELL
+# MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 print("Trainiere Modell...")
 
@@ -167,94 +159,96 @@ model = lgb.train(
 # ─────────────────────────────────────────────────────────────────────────────
 y_pred_proba = model.predict(X_test)
 
-# Threshold Optimierung
 thresholds = np.arange(
     config["model"]["threshold_scan"]["start"],
     config["model"]["threshold_scan"]["end"],
     config["model"]["threshold_scan"]["step"]
 )
 
-f1_scores = [
-    f1_score(y_test, (y_pred_proba >= t).astype(int))
-    for t in thresholds
-]
-
+f1_scores = [f1_score(y_test, (y_pred_proba >= t).astype(int)) for t in thresholds]
 best_thresh = thresholds[np.argmax(f1_scores)]
-y_pred = (y_pred_proba >= best_thresh).astype(int)
 
+y_pred = (y_pred_proba >= best_thresh).astype(int)
 auc = roc_auc_score(y_test, y_pred_proba)
 
 print(f"AUC: {auc:.4f}")
 print(f"Best Threshold: {best_thresh:.2f}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VISUALS
+# DASHBOARD (8 PLOTS)
 # ─────────────────────────────────────────────────────────────────────────────
-fig = plt.figure(figsize=(16, 8))
-ax = fig.add_subplot(111)
+print("Erstelle Dashboard...")
 
+fig = plt.figure(figsize=(20, 22))
+gs = gridspec.GridSpec(4, 2, figure=fig, hspace=0.4, wspace=0.3)
+
+# 1 Histogram
+ax1 = fig.add_subplot(gs[0, 0])
+delays = dep_feat["raw_delay"].clip(-30, 200)
+
+ax1.hist(delays[delays < 0], bins=40, color=COLORS["ok"], alpha=0.7)
+ax1.hist(delays[(delays >= 0) & (delays < 15)], bins=20, color=COLORS["warn"], alpha=0.7)
+ax1.hist(delays[delays >= 15], bins=60, color=COLORS["accent"], alpha=0.7)
+
+ax1.axvline(15, linestyle="--", color="black")
+ax1.set_title("Verteilung der Abflugverspätungen")
+
+# 2 Monat
+ax2 = fig.add_subplot(gs[0, 1])
+(dep_feat.groupby("month")["target"].mean() * 100).plot(kind="bar", ax=ax2, color=COLORS["secondary"])
+ax2.set_title("Verspätungsrate nach Monat")
+
+
+# 3 Tageszeit
+ax3 = fig.add_subplot(gs[1, 0])
+
+hour = dep_feat.groupby("hour_of_day")["target"].mean() * 100
+
+ax3.plot(hour.index, hour.values, color=COLORS["primary"])
+ax3.fill_between(hour.index, hour.values, alpha=0.3)
+
+ax3.set_title("Verspätungsrate nach Tageszeit")
+
+
+# 4 Feature Importance
+ax4 = fig.add_subplot(gs[1, 1])
+fi = pd.Series(model.feature_importance(), index=FEATURE_COLS).sort_values()
+ax4.barh(fi.index, fi.values, color=COLORS["secondary"])
+ax4.set_title("Feature Importance")
+
+# 5 ROC
+ax5 = fig.add_subplot(gs[2, 0])
 fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
-ax.plot(fpr, tpr, color=COLORS["primary"], label=f"AUC={auc:.3f}")
-ax.plot([0,1],[0,1], "k--")
-ax.set_title("ROC Curve")
-ax.legend()
+ax5.plot(fpr, tpr, label=f"AUC={auc:.3f}")
+ax5.plot([0,1],[0,1],"k--")
+ax5.legend()
 
-plt.savefig(OUT_PLOT, dpi=150, bbox_inches="tight")
-plt.close()
+# 6 Confusion
+ax6 = fig.add_subplot(gs[2, 1])
+sns.heatmap(confusion_matrix(y_test, y_pred), annot=True, fmt=",d", ax=ax6)
+
+# 7 PR Curve
+ax7 = fig.add_subplot(gs[3, 0])
+prec, rec, _ = precision_recall_curve(y_test, y_pred_proba)
+ax7.plot(rec, prec)
+
+# 8 Wochentag
+ax8 = fig.add_subplot(gs[3, 1])
+dow = dep_feat.groupby("day_of_week")["target"].mean() * 100
+colors = [COLORS["accent"] if i in [4,6] else COLORS["secondary"] for i in range(7)]
+ax8.bar(range(7), dow.values, color=colors)
+
+fig.suptitle("Flugverspätungs-Prognose Dashboard", fontsize=16)
+
+fig.savefig(OUT_PLOT, dpi=150, bbox_inches="tight")
+plt.close(fig)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SAVE OUTPUTS
+# SAVE
 # ─────────────────────────────────────────────────────────────────────────────
 model.save_model(OUT_MODEL)
 
 with open(OUT_METRICS, "w") as f:
-    json.dump({
-        "auc": float(auc),
-        "threshold": float(best_thresh)
-    }, f)
+    json.dump({"auc": float(auc), "threshold": float(best_thresh)}, f)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# REPORT
-# ─────────────────────────────────────────────────────────────────────────────
-print("\nClassification Report:")
-print(classification_report(y_test, y_pred))
-print("\n✅ Fertig!")
-
-# Classification Report als dict für Zugriff
-report = classification_report(y_test, y_pred, output_dict=True)
-
-prec_delay = report["1"]["precision"]
-rec_delay  = report["1"]["recall"]
-f1_delay   = report["1"]["f1-score"]
-
-print("\n" + "="*70)
-print("DETAILLIERTER MODELL-REPORT")
-print("="*70)
-print(classification_report(y_test, y_pred))
-
-print(f"""
-╔══════════════════════════════════════════════════════════════════╗
-║           BUSINESS SUMMARY – FLIGHT DELAY PREDICTOR              ║
-╠══════════════════════════════════════════════════════════════════╣
-║  Flughafen:   JFK (New York)                                    ║
-║  Airline:     United Airlines (UA)                              ║
-║  Modell:      LightGBM (Gradient Boosting)                      ║
-║  Zeitraum:    Training bis {split_year} | Test danach            ║
-╠══════════════════════════════════════════════════════════════════╣
-║  MODELL-PERFORMANCE                                             ║
-║  AUC-ROC:     {auc:.3f}                                          ║
-║  Precision:   {prec_delay*100:.1f}%                               ║
-║  Recall:      {rec_delay*100:.1f}%                                ║
-║  F1-Score:    {f1_delay:.3f}                                     ║
-╠══════════════════════════════════════════════════════════════════╣
-║  INTERPRETATION                                                 ║
-║  → Modell erkennt {rec_delay*100:.1f}% aller Verspätungen        ║
-║  → {prec_delay*100:.1f}% der Warnungen sind korrekt             ║
-║  → Gute Balance zwischen False Positives & Negatives           ║
-╠══════════════════════════════════════════════════════════════════╣
-║  BUSINESS VALUE                                                 ║
-║  ✔ Frühwarnsystem für kritische Flüge                           ║
-║  ✔ Bessere Ressourcenplanung (Gate, Crew, Service)              ║
-║  ✔ Reduktion von Eskalationskosten                             ║
-╚══════════════════════════════════════════════════════════════════╝
-""")
+print("\n✅ Alles erfolgreich abgeschlossen!")
